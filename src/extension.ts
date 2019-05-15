@@ -8,62 +8,144 @@ import * as vscode from "vscode";
 import { execSync } from "child_process";
 import * as shell from "shelljs";
 
-import { workspace, ExtensionContext } from "vscode";
+import {
+  workspace as Workspace,
+  TextDocument,
+  WorkspaceFolder,
+  Uri,
+  ExtensionContext
+} from "vscode";
 import {
   LanguageClient,
   LanguageClientOptions,
   RevealOutputChannelOn,
-  ServerOptions,
+  ServerOptions
 } from "vscode-languageclient";
 import { platform } from "os";
 
-export function activate(context: ExtensionContext) {
-  testElixir();
+let clients: Map<string, LanguageClient> = new Map();
 
+let _sortedWorkspaceFolders: string[] | undefined;
+function sortedWorkspaceFolders(): string[] {
+  if (_sortedWorkspaceFolders === void 0) {
+    _sortedWorkspaceFolders = Workspace.workspaceFolders
+      ? Workspace.workspaceFolders
+          .map(folder => {
+            let result = folder.uri.toString();
+            if (result.charAt(result.length - 1) !== "/") {
+              result = result + "/";
+            }
+            return result;
+          })
+          .sort((a, b) => {
+            return a.length - b.length;
+          })
+      : [];
+  }
+  return _sortedWorkspaceFolders;
+}
+Workspace.onDidChangeWorkspaceFolders(
+  () => (_sortedWorkspaceFolders = undefined)
+);
+
+function getOuterMostWorkspaceFolder(folder: WorkspaceFolder): WorkspaceFolder {
+  let sorted = sortedWorkspaceFolders();
+  for (let element of sorted) {
+    let uri = folder.uri.toString();
+    if (uri.charAt(uri.length - 1) !== "/") {
+      uri = uri + "/";
+    }
+    if (uri.startsWith(element)) {
+      return Workspace.getWorkspaceFolder(Uri.parse(element))!;
+    }
+  }
+  return folder;
+}
+
+export function activate(context: ExtensionContext) {
   const command =
     platform() == "win32" ? "language_server.bat" : "language_server.sh";
 
-  const serverOpts = {
-    command: context.asAbsolutePath("./elixir-ls-release/" + command)
-  };
+  function didOpenTextDocument(document: TextDocument): void {
+    testElixir();
 
-  // If the extension is launched in debug mode then the debug server options are used
-  // Otherwise the run options are used
-  let serverOptions: ServerOptions = {
-    run: serverOpts,
-    debug: serverOpts
-  };
-
-  // Options to control the language client
-  let clientOptions: LanguageClientOptions = {
-    // Register the server for Elixir documents
-    documentSelector: [
-      { language: "elixir", scheme: "file" },
-      { language: "elixir", scheme: "untitled" }
-    ],
-    // Don't focus the Output pane on errors because request handler errors are no big deal
-    revealOutputChannelOn: RevealOutputChannelOn.Never,
-    synchronize: {
-      // Synchronize the setting section 'elixirLS' to the server
-      configurationSection: "elixirLS",
-      // Notify the server about file changes to Elixir files contained in the workspace
-      fileEvents: [
-        workspace.createFileSystemWatcher("**/*.{ex,exs,erl,yrl,xrl,eex}")
-      ]
+    if (document.languageId !== "elixir" || document.uri.scheme !== "file") {
+      return;
     }
-  };
 
-  // Create the language client and start the client.
-  let disposable = new LanguageClient(
-    "ElixirLS",
-    "ElixirLS",
-    serverOptions,
-    clientOptions
-  ).start();
+    let uri = document.uri;
+    let folder = Workspace.getWorkspaceFolder(uri);
 
-  // Push the disposable to the context's subscriptions so that the
-  // client can be deactivated on extension deactivation
-  context.subscriptions.push(disposable);
+    if (!folder) {
+      return;
+    }
+
+    folder = getOuterMostWorkspaceFolder(folder);
+
+    if (!clients.has(folder.uri.toString())) {
+      const serverOpts = {
+        command: context.asAbsolutePath("./elixir-ls-release/" + command)
+      };
+      let serverOptions: ServerOptions = {
+        run: serverOpts,
+        debug: serverOpts
+      };
+      let clientOptions: LanguageClientOptions = {
+        // Register the server for Elixir documents
+        documentSelector: [
+          {
+            scheme: "file",
+            language: "elixir",
+            pattern: `${folder.uri.fsPath}/**/*`
+          }
+          // { language: "elixir", scheme: "untitled" }
+        ],
+        // Don't focus the Output pane on errors because request handler errors are no big deal
+        revealOutputChannelOn: RevealOutputChannelOn.Never,
+        workspaceFolder: folder,
+        synchronize: {
+          // Synchronize the setting section 'elixirLS' to the server
+          configurationSection: "elixirLS",
+          // Notify the server about file changes to Elixir files contained in the workspace
+          fileEvents: [
+            Workspace.createFileSystemWatcher(
+              `${folder.uri.fsPath}/**/*.{ex,exs,erl,yrl,xrl,eex}`
+            )
+          ]
+        }
+      };
+
+      // Create the language client and start the client.
+      let client = new LanguageClient(
+        "ElixirLS",
+        "ElixirLS",
+        serverOptions,
+        clientOptions
+      );
+      client.start();
+      clients.set(folder.uri.toString(), client);
+    }
+  }
+
+  Workspace.onDidOpenTextDocument(didOpenTextDocument);
+  Workspace.textDocuments.forEach(didOpenTextDocument);
+  Workspace.onDidChangeWorkspaceFolders(event => {
+    for (let folder of event.removed) {
+      let client = clients.get(folder.uri.toString());
+      if (client) {
+        clients.delete(folder.uri.toString());
+        client.stop();
+      }
+    }
+  });
+}
+
+export function deactivate(): Thenable<void> {
+  let promises: Thenable<void>[] = [];
+  for (let client of clients.values()) {
+    promises.push(client.stop());
+  }
+  return Promise.all(promises).then(() => undefined);
 }
 
 function testElixirCommand(command: String) {
